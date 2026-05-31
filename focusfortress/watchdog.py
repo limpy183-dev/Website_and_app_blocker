@@ -43,6 +43,19 @@ _FORCE_B_PID_FILE = DATA_DIR / "watchdog.B.pid"
 _DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 
 
+def _base_cmd() -> list[str]:
+    """Argv prefix to re-invoke this app.
+
+    Frozen (PyInstaller) builds: ``[exe]`` - ``sys.executable`` is
+    ``FocusFortress.exe`` itself, so ``-m focusfortress`` is meaningless and
+    would make the frozen exe receive ``argv[1] == "-m"`` (falling through to
+    the GUI branch).  Source checkouts: ``[python, -m, focusfortress]``.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, "-m", "focusfortress"]
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -108,7 +121,7 @@ def start_watchdog() -> None:
     state["watchdog_should_exit"] = False
     state["main_pid"] = os.getpid()
     save_state(state)
-    _spawn([sys.executable, "-m", "focusfortress", "watchdog", str(os.getpid())])
+    _spawn([*_base_cmd(), "watchdog", str(os.getpid())])
 
 
 def stop_watchdog() -> None:
@@ -125,7 +138,7 @@ def _watchdog_alive() -> bool:
 def run_watchdog(main_pid: int) -> int:
     """Entry point for the *normal* watchdog process."""
     _write_pid(_WATCHDOG_MARK, os.getpid())
-    restart_cmd = [sys.executable, "-m", "focusfortress"]
+    restart_cmd = _base_cmd()
 
     while True:
         time.sleep(2.0)
@@ -192,7 +205,7 @@ def start_force_protect_watchdog() -> None:
     for role in ("A", "B"):
         if _pid_alive(_read_pid(_role_pid_file(role))):
             continue
-        _spawn([sys.executable, "-m", "focusfortress",
+        _spawn([*_base_cmd(),
                 "watchdog", str(os.getpid()), "--force", "--role", role])
 
 
@@ -219,8 +232,8 @@ def run_force_protect_watchdog(main_pid: int, role: str) -> int:
     pid_file = _role_pid_file(role)
     _write_pid(pid_file, os.getpid())
 
-    restart_cmd = [sys.executable, "-m", "focusfortress"]
-    main_args = [sys.executable, "-m", "focusfortress", "--background"]
+    restart_cmd = _base_cmd()
+    main_args = [*_base_cmd(), "--background"]
 
     while True:
         time.sleep(_FORCE_POLL_SECONDS)
@@ -229,6 +242,18 @@ def run_force_protect_watchdog(main_pid: int, role: str) -> int:
             break
 
         # 1) Watch the main process.
+        #
+        # Residual-race mitigation (bug 16): both A and B poll independently,
+        # so on a main-process death both could try to spawn a replacement and
+        # both could relaunch the partner.  We narrow (but cannot fully close)
+        # the window with two cheap measures:
+        #   * a small role-based stagger so role "B" yields to role "A", giving
+        #     A first chance to claim the respawn and publish the new main_pid;
+        #   * a fresh re-read of the state immediately before spawning, plus a
+        #     re-scan for an already-running main, so the laggard sees the
+        #     winner's PID and skips.
+        # Fully eliminating the race needs a shared OS mutex; this is a
+        # deliberate best-effort narrowing.
         tracked = int(state.get("main_pid") or main_pid or 0)
         if not _pid_alive(tracked):
             found = _find_running_focusfortress(exclude_pid=os.getpid())
@@ -236,14 +261,36 @@ def run_force_protect_watchdog(main_pid: int, role: str) -> int:
                 state["main_pid"] = found
                 save_state(state)
             else:
-                # Relaunch in background mode so we don't pop a window.
-                if _spawn(main_args):
-                    log.info("force-protect[%s]: relaunched main process", role)
+                # Yield to role A so it claims the respawn first.
+                if role == "B":
+                    time.sleep(0.25)
+                # Re-read state fresh and double-check the main is still dead;
+                # the partner may have already respawned it and recorded a PID.
+                state = load_state()
+                if not state.get("force_protect_enabled"):
+                    break
+                tracked = int(state.get("main_pid") or main_pid or 0)
+                found = _find_running_focusfortress(exclude_pid=os.getpid())
+                if _pid_alive(tracked) or found:
+                    if found and found != tracked:
+                        state["main_pid"] = found
+                        save_state(state)
+                else:
+                    # Relaunch in background mode so we don't pop a window.
+                    if _spawn(main_args):
+                        log.info("force-protect[%s]: relaunched main process", role)
+                        # Publish the new main PID ASAP so the partner skips on
+                        # its next poll.  Best-effort: the GUI may relaunch
+                        # elevated under a different PID, so re-scan briefly.
+                        new_pid = _find_running_focusfortress(exclude_pid=os.getpid())
+                        if new_pid:
+                            state["main_pid"] = new_pid
+                            save_state(state)
 
         # 2) Watch the partner watchdog.
         p_pid = _read_pid(_role_pid_file(partner))
         if not _pid_alive(p_pid):
-            _spawn([sys.executable, "-m", "focusfortress",
+            _spawn([*_base_cmd(),
                     "watchdog", str(state.get("main_pid", main_pid)),
                     "--force", "--role", partner])
             log.info("force-protect[%s]: relaunched partner %s", role, partner)

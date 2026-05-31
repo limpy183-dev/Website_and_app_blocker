@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
 from dataclasses import asdict
 
 from ...config_store import DEFAULT_DISTRACTIONS
-from ...engine import Engine
+from ...engine import Engine, LockedError
 from ...locks import can_disable, describe_lock
 from ...models import BlockList, LockConfig, WarningConfig, _only_known
 from ...security import hash_password, random_unlock_text
@@ -127,7 +127,10 @@ class _LockEditor(QDialog):
         self.lock.range_end = self.range_end.time().toString("HH:mm")
         self.lock.range_mode = self.range_mode.currentText()
         if self.lock.kind == "timer":
-            until = dt.datetime.now() + dt.timedelta(
+            # Arm with the same monotonic-aware clock that can_disable() uses to
+            # evaluate the lock, so moving the system clock can't shorten it.
+            from ...clock import wall_now
+            until = wall_now() + dt.timedelta(
                 hours=self.timer_hours.value(), minutes=self.timer_minutes.value()
             )
             self.lock.until = until.isoformat(timespec="minutes")
@@ -775,11 +778,25 @@ class BlocksTab(QWidget):
         self.warning_preset.setCurrentData("")
 
     # ---------- list ops ----------
+    def _unique_name(self, name: str, ignore=None) -> bool:
+        """True if ``name`` is not already used by another block."""
+        return not any(
+            b is not ignore and b.name.lower() == name.lower()
+            for b in self.engine.config.blocks
+        )
+
     def _new_block(self) -> None:
         name, ok = QInputDialog.getText(self, "New block", "Name:")
-        if not ok or not name.strip():
+        if not ok:
             return
-        self.engine.config.blocks.append(BlockList(name=name.strip()))
+        name = name.strip()
+        if not name:
+            error(self, "Block name cannot be empty.")
+            return
+        if not self._unique_name(name):
+            error(self, f"A block named '{name}' already exists. Choose a unique name.")
+            return
+        self.engine.config.blocks.append(BlockList(name=name))
         self.engine.save()
         self._reload_list()
         self.list.setCurrentRow(len(self.engine.config.blocks) - 1)
@@ -789,7 +806,14 @@ class BlocksTab(QWidget):
             return
         import copy
         clone = copy.deepcopy(self._current)
-        clone.name = self._current.name + " (copy)"
+        # Find a unique "(copy)" name so duplicating twice doesn't clash.
+        base = self._current.name + " (copy)"
+        name = base
+        n = 2
+        while not self._unique_name(name):
+            name = f"{base} {n}"
+            n += 1
+        clone.name = name
         clone.enabled = False
         self.engine.config.blocks.append(clone)
         self.engine.save()
@@ -810,50 +834,103 @@ class BlocksTab(QWidget):
         self._reload_list()
 
     # ---------- save helpers ----------
+    def _is_locked_active(self) -> bool:
+        """True if the current block is enabled AND has a real (non-none) lock.
+
+        While in this state, enforcement may only be tightened, never loosened
+        (same philosophy as _configure_lock), so we refuse rule edits that would
+        remove entries — emptying the rules would neuter the block ungated.
+        """
+        b = self._current
+        if not b or not b.enabled:
+            return False
+        return (b.lock.kind or "none") not in ("none",)
+
+    @staticmethod
+    def _is_tightening(old_list, new_list) -> bool:
+        """True if new_list keeps every entry in old_list (only adds)."""
+        return set(old_list) <= set(new_list)
+
     def _save_name(self) -> None:
         if not self._current:
             return
         new = self.name_edit.text().strip()
-        if new and new != self._current.name:
-            self._current.name = new
-            self.engine.save()
-            self._reload_list()
+        if new == self._current.name:
+            return
+        # Validate: non-empty, reasonable length, and unique (case-insensitive).
+        if not new:
+            error(self, "Block name cannot be empty.")
+            self.name_edit.blockSignals(True)
+            self.name_edit.setText(self._current.name)
+            self.name_edit.blockSignals(False)
+            return
+        if len(new) > 100:
+            error(self, "Block name is too long (max 100 characters).")
+            self.name_edit.blockSignals(True)
+            self.name_edit.setText(self._current.name)
+            self.name_edit.blockSignals(False)
+            return
+        clash = any(
+            b is not self._current and b.name.lower() == new.lower()
+            for b in self.engine.config.blocks
+        )
+        if clash:
+            error(self, f"A block named '{new}' already exists. Choose a unique name.")
+            self.name_edit.blockSignals(True)
+            self.name_edit.setText(self._current.name)
+            self.name_edit.blockSignals(False)
+            return
+        self._current.name = new
+        self.engine.save()
+        self._reload_list()
 
     def _toggle_enabled(self) -> None:
         if not self._current:
             return
         want = self.enabled_btn.isChecked()
+        # Collect any unlock proof the user can provide, then let the engine make
+        # the final allow/deny decision (it is the single source of truth and
+        # raises LockedError when a locked, active block may not be disabled).
+        password_attempt = None
+        random_attempt = None
+        random_expected = None
         if not want and self._current.enabled:
-            ok, reason = can_disable(self._current)
-            if not ok:
-                if self._current.lock.kind == "random":
-                    expected = random_unlock_text(self._current.lock.random_length)
-                    info(self, "Type the following string EXACTLY to unlock.\n\n" + expected)
-                    from PyQt6.QtWidgets import QInputDialog as D
-                    typed, go = D.getText(self, "Random unlock", "Enter the text:")
-                    if not go or typed != expected:
-                        self._report_unlock_blocked()
-                        error(self, "Unlock text did not match.")
-                        self.enabled_btn.setChecked(True)
-                        return
-                elif self._current.lock.kind == "password":
-                    from PyQt6.QtWidgets import QInputDialog as D
-                    pwd, go = D.getText(
-                        self, "Password", "Password:",
-                        QLineEdit.EchoMode.Password,
-                    )
-                    if not go:
-                        self.enabled_btn.setChecked(True); return
-                    ok2, reason2 = can_disable(self._current, password_attempt=pwd)
-                    if not ok2:
-                        self._report_unlock_blocked()
-                        error(self, reason2); self.enabled_btn.setChecked(True); return
-                else:
-                    self._report_unlock_blocked()
-                    error(self, reason)
+            kind = self._current.lock.kind or "none"
+            if kind == "random":
+                random_expected = random_unlock_text(self._current.lock.random_length)
+                info(self, "Type the following string EXACTLY to unlock.\n\n" + random_expected)
+                from PyQt6.QtWidgets import QInputDialog as D
+                typed, go = D.getText(self, "Random unlock", "Enter the text:")
+                if not go:
                     self.enabled_btn.setChecked(True)
                     return
-        self.engine.set_block_enabled(self._current.name, want)
+                random_attempt = typed
+            elif kind == "password":
+                from PyQt6.QtWidgets import QInputDialog as D
+                pwd, go = D.getText(
+                    self, "Password", "Password:",
+                    QLineEdit.EchoMode.Password,
+                )
+                if not go:
+                    self.enabled_btn.setChecked(True)
+                    return
+                password_attempt = pwd
+
+        try:
+            self.engine.set_block_enabled(
+                self._current.name,
+                want,
+                password_attempt=password_attempt,
+                random_attempt=random_attempt,
+                random_expected=random_expected,
+            )
+        except LockedError as e:
+            # Engine refused the disable: report it (may fire a warning) and
+            # leave the toggle in its previous (enabled) state.
+            self._report_unlock_blocked()
+            error(self, e.reason)
+            self.enabled_btn.setChecked(True)
+            return
         self._reload_list()
         self._populate_from_current()
 
@@ -882,9 +959,19 @@ class BlocksTab(QWidget):
     def _save_sites(self) -> None:
         if not self._current:
             return
-        self._current.sites = [
+        new_sites = [
             l.strip() for l in self.sites_edit.toPlainText().splitlines() if l.strip()
         ]
+        # While active+locked you may only tighten: refuse edits that drop sites.
+        if self._is_locked_active() and not self._is_tightening(self._current.sites, new_sites):
+            error(self, "This block is active and locked. You can only ADD rules "
+                        "(tighten) while it is on — removing blocked patterns is "
+                        "not allowed until the lock releases.")
+            self.sites_edit.blockSignals(True)
+            self.sites_edit.setPlainText("\n".join(self._current.sites))
+            self.sites_edit.blockSignals(False)
+            return
+        self._current.sites = new_sites
         self._current.site_exceptions = [
             l.strip() for l in self.sites_excepts_edit.toPlainText().splitlines() if l.strip()
         ]
@@ -893,17 +980,39 @@ class BlocksTab(QWidget):
     def _save_windows(self) -> None:
         if not self._current:
             return
-        self._current.app_windows = [
+        new_windows = [
             l.strip() for l in self.windows_edit.toPlainText().splitlines() if l.strip()
         ]
+        if self._is_locked_active() and not self._is_tightening(self._current.app_windows, new_windows):
+            error(self, "This block is active and locked. You can only ADD window-"
+                        "title rules (tighten) while it is on — removing them is not "
+                        "allowed until the lock releases.")
+            self.windows_edit.blockSignals(True)
+            self.windows_edit.setPlainText("\n".join(self._current.app_windows))
+            self.windows_edit.blockSignals(False)
+            return
+        self._current.app_windows = new_windows
         self.engine.save()
 
     def _save_users(self) -> None:
         if not self._current:
             return
-        self._current.users = [
+        new_users = [
             l.strip() for l in self.users_edit.toPlainText().splitlines() if l.strip()
         ]
+        # Removing a user from the list narrows who the block applies to, which
+        # loosens enforcement — refuse it while active+locked. (An empty list
+        # means "all users", so going from a restricted list toward empty is a
+        # removal and is likewise refused here.)
+        if self._is_locked_active() and not self._is_tightening(self._current.users, new_users):
+            error(self, "This block is active and locked. You can only ADD users "
+                        "(tighten) while it is on — removing users would narrow who "
+                        "is blocked and is not allowed until the lock releases.")
+            self.users_edit.blockSignals(True)
+            self.users_edit.setPlainText("\n".join(self._current.users))
+            self.users_edit.blockSignals(False)
+            return
+        self._current.users = new_users
         self.engine.save()
 
     def _save_allowance(self) -> None:

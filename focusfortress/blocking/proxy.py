@@ -109,6 +109,11 @@ class _Handler(BaseHTTPRequestHandler):
     block_message: str = "This site is blocked by FocusFortress."
     block_page_html: str = ""
     proxy_port: int = 58123
+    # Context about the active block (set by the engine each apply tick): the
+    # name of the block doing the blocking and a short human detail such as
+    # "1h 22m left". Empty strings mean "unknown / not provided".
+    block_name: str = ""
+    block_detail: str = ""
 
     # Force the framework to close the client connection after each response.
     # This sidesteps any chance of HTTP/1.1 keep-alive desync between us and
@@ -126,6 +131,17 @@ class _Handler(BaseHTTPRequestHandler):
     # ---- helpers ----
 
     def _serve_block_page(self) -> None:
+        # Build an optional "Blocked by 'Work' — 1h 22m left" banner from the
+        # active-block context the engine pushes in. Falls back gracefully when
+        # no context is set.
+        import html as _html
+        if self.block_name:
+            ctx = f"Blocked by &lsquo;{_html.escape(self.block_name)}&rsquo;"
+            if self.block_detail:
+                ctx += f" &mdash; {_html.escape(self.block_detail)}"
+        else:
+            ctx = ""
+        ctx_html = f"<p class='ctx'>{ctx}</p>" if ctx else ""
         html = self.block_page_html or f"""
         <!doctype html><html><head><meta charset='utf-8'>
         <title>Blocked</title>
@@ -133,9 +149,11 @@ class _Handler(BaseHTTPRequestHandler):
         display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}
         .card{{max-width:620px;padding:48px;text-align:center;background:#1b1b1b;border-radius:16px;
         box-shadow:0 10px 40px rgba(0,0,0,.4)}}
-        h1{{margin:0 0 16px;font-weight:600}} p{{opacity:.8;line-height:1.5}}</style>
+        h1{{margin:0 0 16px;font-weight:600}} p{{opacity:.8;line-height:1.5}}
+        .ctx{{opacity:1;font-weight:600;color:#9ab;margin:0 0 18px}}</style>
         </head><body><div class='card'>
         <h1>Blocked by FocusFortress</h1>
+        {ctx_html}
         <p>{self.block_message}</p>
         </div></body></html>
         """.strip()
@@ -227,6 +245,17 @@ class _Handler(BaseHTTPRequestHandler):
         # a browser, or a browser auto-discovery probe). Nothing to forward.
         if not target.startswith(("http://", "https://")):
             self._serve_block_page()
+            return
+
+        # An absolute https:// URL arriving on a normal method (not CONNECT)
+        # must NOT be forwarded: _forward_http speaks cleartext HTTP, so it
+        # would send the request in the clear to port 443. HTTPS is only ever
+        # handled via the CONNECT tunnel path. Refuse rather than downgrade.
+        if target.startswith("https://"):
+            try:
+                self.send_error(400, "https requires CONNECT")
+            except Exception:
+                pass
             return
 
         # Decide blocking BEFORE consuming the body so we can drop large
@@ -522,6 +551,16 @@ class BlockingProxy:
         self._html = html or ""
         _Handler.block_message = self._msg
         _Handler.block_page_html = self._html
+
+    def set_block_context(self, block_name: str = "", detail: str = "") -> None:
+        """Set the active-block context shown on the default block page.
+
+        ``block_name`` is the name of the block doing the blocking and
+        ``detail`` a short human string (e.g. "1h 22m left"). Pass empty
+        strings to clear the banner.
+        """
+        _Handler.block_name = block_name or ""
+        _Handler.block_detail = detail or ""
 
     def start(self) -> None:
         if self._server:

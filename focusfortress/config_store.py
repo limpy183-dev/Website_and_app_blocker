@@ -1,16 +1,74 @@
 """Thread-safe JSON config + stats persistence."""
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import threading
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Optional
 
 from .models import AppConfig, BlockList, GlobalSettings
 from .paths import CONFIG_FILE, STATS_FILE, STATE_FILE, ensure_data_dirs
 
 
 _lock = threading.RLock()
+
+
+# ---- Cross-process lock for state.json -------------------------------------
+#
+# state.json is read-modify-written by up to four separate processes (the main
+# engine, the normal watchdog, and both force-protect watchdogs). The
+# per-process RLock (`_lock`) only serialises threads *within* one process, so
+# without an inter-process lock a save built on a slightly-stale read can clobber
+# keys another process wrote concurrently (e.g. the engine's cooldown/clock
+# state). `_state_cross_process_lock()` provides that coordination via a Windows
+# named mutex. It is fail-soft by design: on non-Windows, or if anything goes
+# wrong creating/acquiring the mutex, it degrades to a plain no-op (the
+# in-process RLock still applies) so the cross-platform test suite keeps passing.
+
+@contextlib.contextmanager
+def _state_cross_process_lock(timeout_ms: int = 5000):
+    """Best-effort cross-process mutex around state.json writes.
+
+    On Windows acquires a named mutex (``Local\\FocusFortress_state_mutex``).
+    On any failure or on non-Windows platforms this is a no-op and callers rely
+    on the in-process RLock. Never raises.
+    """
+    handle = None
+    kernel32 = None
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            # "Local\\" namespace works without elevation; a "Global\\" mutex
+            # would be ideal for cross-session coordination but can be denied,
+            # so we use the always-available Local namespace.
+            name = "Local\\FocusFortress_state_mutex"
+            handle = kernel32.CreateMutexW(None, False, name)
+            if handle:
+                # WaitForSingleObject returns regardless of whether we actually
+                # got ownership; either way we proceed after the timeout so a
+                # stuck holder can never hang us indefinitely.
+                kernel32.WaitForSingleObject(handle, int(timeout_ms))
+            else:
+                kernel32 = None  # nothing to release/close
+        except Exception:
+            handle = None
+            kernel32 = None
+    try:
+        yield
+    finally:
+        if handle and kernel32 is not None:
+            try:
+                kernel32.ReleaseMutex(handle)
+            except Exception:
+                pass
+            try:
+                kernel32.CloseHandle(handle)
+            except Exception:
+                pass
 
 
 DEFAULT_DISTRACTIONS = [
@@ -99,7 +157,30 @@ def load_state() -> Dict[str, Any]:
 
 def save_state(state: Dict[str, Any]) -> None:
     with _lock:
-        ensure_data_dirs()
-        tmp = STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        tmp.replace(STATE_FILE)
+        with _state_cross_process_lock():
+            ensure_data_dirs()
+            tmp = STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            tmp.replace(STATE_FILE)
+
+
+def update_state(mutator: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Atomically load, mutate and save state under both locks.
+
+    Performs a locked read-modify-write so callers don't race on the unguarded
+    ``load_state(); state[...] = ...; save_state(state)`` sequence across
+    processes. ``mutator`` is called with the current state dict; it may mutate
+    it in place (returning ``None``) or return a replacement dict. The whole
+    cycle runs under the in-process RLock *and* the cross-process mutex, so the
+    read the save is built on cannot be stale relative to another writer.
+
+    Returns the state dict that was saved.
+    """
+    with _lock:
+        with _state_cross_process_lock():
+            state = load_state()
+            result = mutator(state)
+            if result is not None:
+                state = result
+            save_state(state)
+            return state

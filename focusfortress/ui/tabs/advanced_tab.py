@@ -259,6 +259,31 @@ class AdvancedTab(QWidget):
     def _is_locked(self) -> bool:
         return not cooldown.is_unlocked()
 
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        """Consume an unused unlock when the tab leaves the screen.
+
+        ``cooldown.mark_unlocked()`` persists ``unlocked:true`` as soon as the
+        1-hour wait elapses and the user clicks Unlock.  The normal Save flow
+        consumes it (``_save`` -> ``cooldown.consume_unlock()``), re-arming the
+        lock.  But if the user unlocks and then navigates away / closes the
+        window WITHOUT saving, that flag would survive and grant a free edit in
+        the next session.
+
+        This page is a child of a ``QStackedWidget`` and the main window's
+        ``closeEvent`` calls ``self.hide()``, so a hideEvent fires both when the
+        user switches tabs and when the window is hidden/closed.  If an unlock
+        is still outstanding (i.e. it was NOT consumed by a save) we consume it
+        here so an unused unlock never persists.  After a save the state no
+        longer reports unlocked, so this never double-consumes.
+        """
+        try:
+            if cooldown.is_unlocked():
+                cooldown.consume_unlock()
+                self._refresh_banner()
+        except Exception:
+            pass
+        super().hideEvent(event)
+
     def _handle_blocked_attempt(self) -> None:
         # Ensure a timer is running.  start_cooldown() is idempotent: if
         # one is already counting down it preserves the existing deadline.

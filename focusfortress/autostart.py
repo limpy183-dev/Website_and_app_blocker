@@ -38,6 +38,30 @@ def _get_python_exe() -> str:
     return exe
 
 
+def _vbs_run_args() -> list[str]:
+    """Return the argument list (already shell-style) for the VBS Run line.
+
+    * Frozen (PyInstaller) build: ``sys.executable`` *is* ``FocusFortress.exe``
+      and there is no pythonw / ``-m`` to speak of, so we launch the exe
+      directly with ``--background``.
+    * Source checkout: launch ``pythonw.exe -m focusfortress --background``.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--background"]
+    return [_get_python_exe(), "-m", "focusfortress", "--background"]
+
+
+def _launch_working_dir() -> str:
+    """Working directory the VBS launcher should set before running us.
+
+    Frozen builds run from the exe's own directory; source checkouts run from
+    the project root so ``-m focusfortress`` resolves.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return _get_project_dir()
+
+
 def _get_vbs_path() -> Path:
     """Return the path where the VBS launcher script will be saved."""
     from .paths import DATA_DIR
@@ -47,16 +71,21 @@ def _get_vbs_path() -> Path:
 def _write_vbs_launcher() -> Path:
     """Generate the VBS boot-launcher script and return its path."""
     vbs_path = _get_vbs_path()
-    project_dir = _get_project_dir()
-    python_exe = _get_python_exe()
+    working_dir = _launch_working_dir()
+
+    # Build the VBS Run line.  Each argument is wrapped in a "" pair so that
+    # paths containing spaces survive (VBS escapes a literal double-quote as
+    # "").  Frozen: "<exe>" "--background"; source: "<pythonw>" "-m"
+    # "focusfortress" "--background".
+    run_args = "".join(f'""{arg}"" ' for arg in _vbs_run_args()).strip()
 
     vbs_content = (
         "' FocusFortress Boot Launcher (auto-generated)\n"
         "Dim WshShell\n"
         'Set WshShell = CreateObject("WScript.Shell")\n'
         "WScript.Sleep 15000\n"
-        f'WshShell.CurrentDirectory = "{project_dir}"\n'
-        f'WshShell.Run """{python_exe}"" ""-m"" ""focusfortress"" ""--background""", 0, False\n'
+        f'WshShell.CurrentDirectory = "{working_dir}"\n'
+        f'WshShell.Run "{run_args}", 0, False\n'
         "Set WshShell = Nothing\n"
     )
 

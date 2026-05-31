@@ -20,13 +20,22 @@ from .blocking.apps import AppBlocker
 from .blocking.doh import resolve_blocklist as doh_block_list
 from .blocking.hosts import clear_block_section, flush_dns, write_block_section
 from .blocking.proxy import BlockingProxy
-from .blocking.winproxy import disable_proxy, enable_proxy, read_proxy
+from .blocking.winproxy import _DEFAULT_BYPASS, disable_proxy, enable_proxy, read_proxy
 from .config_store import load_config, load_state, save_config, save_state
 from .idle import idle_seconds
+from .locks import can_disable
 from .models import AppConfig, BlockList, ScheduleSlot, WarningConfig
 from .warnings import resolve_warning_message
 
 log = logging.getLogger("focusfortress.engine")
+
+
+class LockedError(Exception):
+    """Raised when a block cannot be disabled because its lock denies it."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
 
 
 @dataclass(frozen=True)
@@ -45,6 +54,18 @@ def _current_user() -> str:
 
 def _now() -> dt.datetime:
     return clock.wall_now()
+
+
+def _format_remaining(delta: dt.timedelta) -> str:
+    """Format a positive timedelta as a short string like '1h 22m' or '45m'."""
+    secs = max(0, int(delta.total_seconds()))
+    h, rem = divmod(secs, 3600)
+    m, _ = divmod(rem, 60)
+    if h and m:
+        return f"{h}h {m}m"
+    if h:
+        return f"{h}h"
+    return f"{m}m"
 
 
 def _slot_active_now(slot: ScheduleSlot, now: dt.datetime) -> bool:
@@ -71,12 +92,21 @@ class Engine:
         self._apps = AppBlocker(poll_seconds=1.0)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        # Cache of allowance consumption tick
-        self._last_allowance_tick = time.time()
+        # Guards config mutation/save across the engine thread and CLI/UI callers.
+        self._state_lock = threading.RLock()
+        # Cache of allowance consumption tick (monotonic: immune to clock moves).
+        self._last_allowance_tick = time.monotonic()
+        # Frozen Turkey: only fire the action on window ENTRY, not every tick.
+        self._frozen_turkey_actioned = False
+        # Pre-action countdown state (report §2.7).
+        self._frozen_pending_deadline: Optional[float] = None  # monotonic
+        self._frozen_cancelled_window = False
+        self._frozen_action_handler: Optional[Callable[[str, int], None]] = None
         # Pomodoro state
-        self._pomo_phase: str = "idle"    # idle|work|break
+        self._pomo_phase: str = "idle"    # idle|work|break|long_break
         self._pomo_phase_until: Optional[dt.datetime] = None
         self._pomo_cycle: int = 0
+        self._pomo_paused_remaining: Optional[float] = None  # seconds left when paused
         # ---- Warning subsystem state ----
         # Several entry points drive warnings (see the warning section below);
         # each keeps its own "what was active last pass" set so they don't
@@ -101,11 +131,25 @@ class Engine:
 
     # ---------- public API ----------
 
+    def _lock(self) -> threading.RLock:
+        """Return the reentrant state lock, creating it lazily.
+
+        Some tests build the engine via ``Engine.__new__`` (bypassing
+        ``__init__``); creating the lock on first use keeps those paths working
+        without requiring full construction.
+        """
+        lock = getattr(self, "_state_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._state_lock = lock
+        return lock
+
     def reload_config(self) -> None:
         self.config = load_config()
 
     def save(self) -> None:
-        save_config(self.config)
+        with self._lock():
+            save_config(self.config)
 
     def add_warning_listener(self, listener: Callable) -> None:
         """Register a warning listener.
@@ -149,24 +193,58 @@ class Engine:
                 return b
         return None
 
-    def set_block_enabled(self, name: str, enabled: bool) -> bool:
-        b = self.find_block(name)
-        if not b:
-            return False
-        b.enabled = bool(enabled)
-        if enabled and not b.active_since:
-            b.active_since = _now().isoformat(timespec="seconds")
-        if not enabled:
-            b.active_since = None
-        self.save()
-        self._apply()
-        return True
+    def set_block_enabled(
+        self,
+        name: str,
+        enabled: bool,
+        *,
+        password_attempt=None,
+        random_attempt=None,
+        random_expected=None,
+    ) -> bool:
+        with self._lock():
+            b = self.find_block(name)
+            if not b:
+                return False
+            # Centralized lock enforcement: disabling an active, locked block
+            # must pass the lock's can_disable() gate.
+            if (not enabled) and b.enabled and (b.lock.kind or "none") != "none":
+                allowed, reason = can_disable(
+                    b,
+                    password_attempt=password_attempt,
+                    random_attempt=random_attempt,
+                    random_expected=random_expected,
+                )
+                if not allowed:
+                    raise LockedError(reason)
+            b.enabled = bool(enabled)
+            if enabled and not b.active_since:
+                b.active_since = _now().isoformat(timespec="seconds")
+            if not enabled:
+                b.active_since = None
+            self.save()
+            self._apply()
+            return True
 
-    def toggle_block(self, name: str) -> bool:
-        b = self.find_block(name)
-        if not b:
-            return False
-        return self.set_block_enabled(name, not b.enabled)
+    def toggle_block(
+        self,
+        name: str,
+        *,
+        password_attempt=None,
+        random_attempt=None,
+        random_expected=None,
+    ) -> bool:
+        with self._lock():
+            b = self.find_block(name)
+            if not b:
+                return False
+            return self.set_block_enabled(
+                name,
+                not b.enabled,
+                password_attempt=password_attempt,
+                random_attempt=random_attempt,
+                random_expected=random_expected,
+            )
 
     # ---------- lifecycle ----------
 
@@ -275,7 +353,35 @@ class Engine:
                 return True
         return False
 
+    def _block_page_context(
+        self, active_blocks: List[BlockList], now: dt.datetime
+    ) -> tuple[str, str]:
+        """Return ``(block_name, detail)`` for the block-page banner.
+
+        Picks the first active block. ``detail`` is its custom message if set,
+        otherwise the time left on a timer lock (e.g. "1h 22m left"), otherwise
+        empty.
+        """
+        if not active_blocks:
+            return "", ""
+        b = active_blocks[0]
+        if b.custom_block_message:
+            return b.name, b.custom_block_message
+        if b.lock.kind == "timer" and b.lock.until:
+            try:
+                until = dt.datetime.fromisoformat(b.lock.until)
+                remaining = until - now
+                if remaining.total_seconds() > 0:
+                    return b.name, f"{_format_remaining(remaining)} left"
+            except ValueError:
+                pass
+        return b.name, ""
+
     def _apply(self) -> None:
+        with self._lock():
+            self._apply_locked()
+
+    def _apply_locked(self) -> None:
         now = _now()
         user = _current_user()
 
@@ -327,6 +433,12 @@ class Engine:
             self.config.settings.motivational_quote,
             self.config.settings.custom_block_page_html,
         )
+        # Tell the proxy which block is responsible (for the block-page banner).
+        # Guarded so a minimal proxy implementation without this optional hook
+        # still works.
+        _set_ctx = getattr(self._proxy, "set_block_context", None)
+        if callable(_set_ctx):
+            _set_ctx(*self._block_page_context(active_blocks, now))
 
         # Update app blocker
         self._apps.set_rules(exe_paths, folders, windows, store)
@@ -340,9 +452,9 @@ class Engine:
             # Re-assert the WinINET proxy in case the user tried to turn it off.
             if self.config.settings.revert_proxy_tampering:
                 try:
-                    enabled, server, _ = read_proxy()
+                    enabled, server, bypass = read_proxy()
                     expected = f"127.0.0.1:{self.config.settings.proxy_port}"
-                    if (not enabled) or server != expected:
+                    if (not enabled) or server != expected or (bypass or "") != _DEFAULT_BYPASS:
                         enable_proxy("127.0.0.1", self.config.settings.proxy_port)
                 except Exception as e:
                     log.debug("revert_proxy_tampering: %s", e)
@@ -567,7 +679,11 @@ class Engine:
     def _emit_block_activation_warnings(self, active_blocks: List[BlockList]) -> None:
         """Notify listeners for the first newly-active block with an enabled warning.
 
-        Listeners are invoked as ``listener(block_name, warning_config)``.
+        Listeners are invoked as ``listener(block_name, warning_config)``.  This
+        is an alternate (currently unused by ``_apply``) entry point whose
+        two-argument convention is pinned by ``tests/test_engine_warnings.py``;
+        the ``_apply``/``_fire_warning`` path uses the single-``WarningEvent``
+        convention instead.
         """
         seen = getattr(self, "_active_warning_blocks", None)
         if seen is None:
@@ -590,60 +706,69 @@ class Engine:
     # ---------- allowances ----------
 
     def _reset_allowances_if_new_day(self) -> None:
-        today = dt.date.today().isoformat()
-        dirty = False
-        for b in self.config.blocks:
-            if b.allowance.minutes_per_day <= 0:
-                continue
-            if b.allowance.last_reset != today:
-                b.allowance.minutes_left_today = b.allowance.minutes_per_day
-                b.allowance.last_reset = today
-                dirty = True
-        if dirty:
-            self.save()
+        with self._lock():
+            today = _now().date().isoformat()
+            dirty = False
+            for b in self.config.blocks:
+                if b.allowance.minutes_per_day <= 0:
+                    continue
+                if b.allowance.last_reset != today:
+                    b.allowance.minutes_left_today = b.allowance.minutes_per_day
+                    b.allowance.last_reset = today
+                    dirty = True
+            if dirty:
+                self.save()
 
     def _consume_allowances(self) -> None:
         """If the user is actively viewing a blocked resource, burn allowance minutes."""
-        # We approximate "in foreground with active input" via idle detection.
-        if idle_seconds() > 180:  # 3 min idle -> don't count
-            return
-        now = time.time()
-        elapsed = now - self._last_allowance_tick
-        if elapsed < 30:
-            return
-        self._last_allowance_tick = now
-        minutes_elapsed = elapsed / 60.0
-        dirty = False
-        for b in self.config.blocks:
-            if b.allowance.minutes_per_day <= 0:
-                continue
-            if b.allowance.minutes_left_today <= 0:
-                continue
-            # Only burn if block was manually enabled or its schedule window says so;
-            # otherwise there is nothing to bypass.
-            now_dt = _now()
-            scheduled = any(_slot_active_now(s, now_dt) for s in b.schedule)
-            if not (b.enabled or scheduled):
-                continue
-            b.allowance.minutes_left_today = max(
-                0, int(round(b.allowance.minutes_left_today - minutes_elapsed))
-            )
-            dirty = True
-        if dirty:
-            self.save()
+        with self._lock():
+            # We approximate "in foreground with active input" via idle detection.
+            if idle_seconds() > 180:  # 3 min idle -> don't count
+                return
+            # Use a monotonic delta: immune to system-clock moves, so a user can't
+            # refill allowance by rewinding the wall clock.
+            now_mono = time.monotonic()
+            last_tick = getattr(self, "_last_allowance_tick", None)
+            if last_tick is None:
+                self._last_allowance_tick = now_mono
+                return
+            elapsed = now_mono - last_tick
+            if elapsed < 30:
+                return
+            self._last_allowance_tick = now_mono
+            minutes_elapsed = elapsed / 60.0
+            dirty = False
+            for b in self.config.blocks:
+                if b.allowance.minutes_per_day <= 0:
+                    continue
+                if b.allowance.minutes_left_today <= 0:
+                    continue
+                # Only burn if block was manually enabled or its schedule window says so;
+                # otherwise there is nothing to bypass.
+                now_dt = _now()
+                scheduled = any(_slot_active_now(s, now_dt) for s in b.schedule)
+                if not (b.enabled or scheduled):
+                    continue
+                b.allowance.minutes_left_today = max(
+                    0, int(round(b.allowance.minutes_left_today - minutes_elapsed))
+                )
+                dirty = True
+            if dirty:
+                self.save()
 
     def grant_allowance(self, block_name: str, minutes: int) -> bool:
-        b = self.find_block(block_name)
-        if not b:
-            return False
-        b.allowance.minutes_left_today = max(0, b.allowance.minutes_left_today + int(minutes))
-        if b.allowance.last_reset == "":
-            b.allowance.last_reset = dt.date.today().isoformat()
-        if b.allowance.minutes_per_day < b.allowance.minutes_left_today:
-            b.allowance.minutes_per_day = b.allowance.minutes_left_today
-        self.save()
-        self._apply()
-        return True
+        with self._lock():
+            b = self.find_block(block_name)
+            if not b:
+                return False
+            b.allowance.minutes_left_today = max(0, b.allowance.minutes_left_today + int(minutes))
+            if b.allowance.last_reset == "":
+                b.allowance.last_reset = _now().date().isoformat()
+            if b.allowance.minutes_per_day < b.allowance.minutes_left_today:
+                b.allowance.minutes_per_day = b.allowance.minutes_left_today
+            self.save()
+            self._apply()
+            return True
 
     # ---------- pomodoro ----------
 
@@ -654,6 +779,7 @@ class Engine:
         self._pomo_phase = "work"
         self._pomo_phase_until = _now() + dt.timedelta(minutes=cfg.work_minutes)
         self._pomo_cycle = 0
+        self._pomo_paused_remaining = None
         self.set_block_enabled(cfg.target_block, True)
         self._fire_pomodoro_warning(cfg.work_message)
 
@@ -661,23 +787,73 @@ class Engine:
         cfg = self.config.settings.pomodoro
         self._pomo_phase = "idle"
         self._pomo_phase_until = None
+        self._pomo_paused_remaining = None
         if cfg.target_block:
             self.set_block_enabled(cfg.target_block, False)
+
+    def pause_pomodoro(self) -> None:
+        """Freeze the countdown, remembering how much time was left."""
+        if self._pomo_phase == "idle" or self._pomo_paused_remaining is not None:
+            return
+        if self._pomo_phase_until is not None:
+            self._pomo_paused_remaining = max(
+                0.0, (self._pomo_phase_until - _now()).total_seconds()
+            )
+        else:
+            self._pomo_paused_remaining = 0.0
+
+    def resume_pomodoro(self) -> None:
+        """Resume a paused countdown from where it left off."""
+        if self._pomo_paused_remaining is None:
+            return
+        self._pomo_phase_until = _now() + dt.timedelta(seconds=self._pomo_paused_remaining)
+        self._pomo_paused_remaining = None
+
+    def is_pomodoro_paused(self) -> bool:
+        return self._pomo_paused_remaining is not None
+
+    def skip_pomodoro_phase(self) -> None:
+        """End the current phase immediately and advance to the next one."""
+        if self._pomo_phase == "idle":
+            return
+        self._pomo_paused_remaining = None
+        self._pomo_phase_until = _now()  # makes _update_pomodoro flip now
+        self._update_pomodoro()
+
+    def pomodoro_status(self) -> Optional[dict]:
+        """Return the live Pomodoro state, or ``None`` when idle.
+
+        Keys: ``phase`` (work|break|long_break), ``remaining_seconds``,
+        ``paused`` (bool), ``cycle`` (1-based), ``cycles``.
+        """
+        if self._pomo_phase == "idle":
+            return None
+        cfg = self.config.settings.pomodoro
+        if self._pomo_paused_remaining is not None:
+            remaining = int(self._pomo_paused_remaining)
+        elif self._pomo_phase_until is not None:
+            remaining = max(0, int((self._pomo_phase_until - _now()).total_seconds()))
+        else:
+            remaining = 0
+        return {
+            "phase": self._pomo_phase,
+            "remaining_seconds": remaining,
+            "paused": self._pomo_paused_remaining is not None,
+            "cycle": self._pomo_cycle + 1,
+            "cycles": cfg.cycles,
+        }
 
     def _update_pomodoro(self) -> None:
         cfg = self.config.settings.pomodoro
         if not cfg.enabled or self._pomo_phase == "idle":
             return
+        # While paused the countdown is frozen.
+        if self._pomo_paused_remaining is not None:
+            return
         if self._pomo_phase_until and _now() < self._pomo_phase_until:
             return
         # Phase flip
-        if self._pomo_phase == "work":
-            self._pomo_phase = "break"
-            self._pomo_phase_until = _now() + dt.timedelta(minutes=cfg.break_minutes)
-            if cfg.target_block:
-                self.set_block_enabled(cfg.target_block, False)
-            self._fire_pomodoro_warning(cfg.break_message)
-        else:
+        if self._pomo_phase in ("break", "long_break"):
             self._pomo_cycle += 1
             if self._pomo_cycle >= cfg.cycles:
                 self._fire_pomodoro_warning(cfg.complete_message)
@@ -688,27 +864,47 @@ class Engine:
             if cfg.target_block:
                 self.set_block_enabled(cfg.target_block, True)
             self._fire_pomodoro_warning(cfg.work_message)
+        else:  # was "work" -> break
+            # Long break every Nth completed work cycle (report §3.9).
+            every = int(getattr(cfg, "long_break_every", 0) or 0)
+            completed = self._pomo_cycle + 1  # this work cycle just finished
+            if every > 0 and completed % every == 0:
+                self._pomo_phase = "long_break"
+                mins = int(getattr(cfg, "long_break_minutes", cfg.break_minutes))
+            else:
+                self._pomo_phase = "break"
+                mins = cfg.break_minutes
+            self._pomo_phase_until = _now() + dt.timedelta(minutes=mins)
+            if cfg.target_block:
+                self.set_block_enabled(cfg.target_block, False)
+            self._fire_pomodoro_warning(cfg.break_message)
 
     # ---------- frozen turkey ----------
 
-    def _update_frozen_turkey(self) -> None:
-        ft = self.config.settings.frozen_turkey
-        if not ft.enabled:
-            return
-        now = _now()
-        if now.weekday() not in ft.days:
-            return
-        try:
-            s = dt.time.fromisoformat(ft.start)
-            e = dt.time.fromisoformat(ft.end)
-        except ValueError:
-            return
-        t = now.time()
-        in_window = (s <= t <= e) if s <= e else (t >= s or t <= e)
-        if not in_window:
-            return
+    def set_frozen_action_handler(
+        self, handler: Optional[Callable[[str, int], None]]
+    ) -> None:
+        """Register a UI handler for the Frozen Turkey pre-action countdown.
 
-        action = ft.action
+        When set, entering the Frozen Turkey window calls ``handler(action,
+        warn_seconds)`` *instead* of running the action immediately, so the UI
+        can show a cancellable countdown and then call
+        :meth:`perform_frozen_action` (or :meth:`cancel_frozen_turkey`).
+
+        With no handler registered (headless mode) the engine runs the action
+        directly after the same delay, exactly as before.
+        """
+        self._frozen_action_handler = handler
+
+    def cancel_frozen_turkey(self) -> None:
+        """Abort the pending Frozen Turkey action for the current window."""
+        self._frozen_cancelled_window = True
+        self._frozen_turkey_actioned = True  # don't re-fire until the window resets
+
+    def perform_frozen_action(self, action: str) -> None:
+        """Execute a Frozen Turkey action (lock / logoff / shutdown)."""
+        if self._frozen_cancelled_window:
+            return
         if action == "lock":
             try:
                 import ctypes
@@ -727,3 +923,62 @@ class Engine:
                                  creationflags=0x08000000)
             except Exception:
                 pass
+
+    def _update_frozen_turkey(self) -> None:
+        ft = self.config.settings.frozen_turkey
+        if not ft.enabled:
+            self._reset_frozen_state()
+            return
+        now = _now()
+        if now.weekday() not in ft.days:
+            self._reset_frozen_state()
+            return
+        try:
+            s = dt.time.fromisoformat(ft.start)
+            e = dt.time.fromisoformat(ft.end)
+        except ValueError:
+            return
+        t = now.time()
+        in_window = (s <= t <= e) if s <= e else (t >= s or t <= e)
+        if not in_window:
+            # Left the window - re-arm so the next entry fires again.
+            self._reset_frozen_state()
+            return
+        if self._frozen_turkey_actioned or self._frozen_cancelled_window:
+            # Already actioned/cancelled this window; don't re-fire every tick.
+            return
+
+        warn_seconds = int(getattr(ft, "warn_seconds", 60) or 0)
+        handler = getattr(self, "_frozen_action_handler", None)
+
+        if warn_seconds > 0 and handler is not None:
+            # Delegate the countdown to the UI (it will call back to
+            # perform_frozen_action / cancel_frozen_turkey).
+            self._frozen_turkey_actioned = True
+            try:
+                handler(ft.action, warn_seconds)
+            except Exception:
+                log.exception("frozen action handler failed")
+                # Handler broke - fall back to firing directly so the rule
+                # still has teeth.
+                self.perform_frozen_action(ft.action)
+            return
+
+        if warn_seconds > 0:
+            # Headless: count down internally before firing.
+            if self._frozen_pending_deadline is None:
+                self._frozen_pending_deadline = time.monotonic() + warn_seconds
+                return
+            if time.monotonic() < self._frozen_pending_deadline:
+                return
+
+        # No warning configured (or countdown elapsed): fire now.
+        self._frozen_turkey_actioned = True
+        self._frozen_pending_deadline = None
+        self.perform_frozen_action(ft.action)
+
+    def _reset_frozen_state(self) -> None:
+        self._frozen_turkey_actioned = False
+        self._frozen_pending_deadline = None
+        self._frozen_cancelled_window = False
+

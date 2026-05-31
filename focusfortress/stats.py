@@ -62,13 +62,59 @@ def _get_foreground_info() -> tuple[str, str] | None:
 
 _URL_IN_TITLE = re.compile(r"[\w.-]+\.[a-z]{2,}", re.IGNORECASE)
 
+# A URL anywhere in the title (with a scheme or "//") is an unambiguous site.
+_URL_WITH_SCHEME = re.compile(
+    r"\b(?:https?://)?([\w.-]+\.[a-z]{2,})(?:/\S*)", re.IGNORECASE
+)
+
+# File extensions that look domain-like ("report.docx") but are NOT websites.
+# A title token whose final label is one of these is ignored.
+_FILE_EXTENSIONS = frozenset({
+    "docx", "doc", "pdf", "txt", "xlsx", "xls", "pptx", "ppt", "csv",
+    "png", "jpg", "jpeg", "gif", "bmp", "svg", "webp", "ico", "tiff",
+    "mp3", "mp4", "wav", "avi", "mov", "mkv", "flac", "webm",
+    "zip", "rar", "7z", "tar", "gz", "exe", "msi", "dll", "iso",
+    "py", "js", "ts", "json", "xml", "html", "htm", "css", "md",
+    "log", "ini", "cfg", "tmp", "bak", "dat", "db",
+})
+
+# A conservative set of common TLDs. A bare "x.y" token is only treated as a
+# site when its final label is a recognised TLD (so "report.docx" is ignored
+# but "facebook.com" is kept). URLs carrying a scheme/slash bypass this.
+_KNOWN_TLDS = frozenset({
+    "com", "net", "org", "io", "co", "gov", "edu", "mil", "int",
+    "info", "biz", "tv", "me", "us", "uk", "ca", "de", "fr", "jp",
+    "ru", "cn", "in", "au", "br", "it", "nl", "es", "se", "no", "fi",
+    "ch", "be", "at", "dk", "pl", "cz", "gr", "pt", "ie", "nz", "kr",
+    "app", "dev", "ai", "xyz", "online", "site", "tech", "store",
+    "news", "blog", "live", "gg", "to", "ly", "fm", "cc", "social",
+})
+
 
 def _extract_site_from_title(title: str) -> Optional[str]:
-    # Browser window titles like "Page Name - Google Chrome" often don't contain URLs.
-    # This is best-effort: match any domain-like substring.
-    m = _URL_IN_TITLE.search(title)
+    # Browser window titles like "Page Name - Google Chrome" often don't contain
+    # full URLs. This is best-effort, but we avoid treating ordinary file names
+    # ("report.docx") as visited sites.
+    if not title:
+        return None
+
+    # 1. A token carrying a scheme or path is unambiguously a URL.
+    m = _URL_WITH_SCHEME.search(title)
     if m:
-        return m.group(0).lower()
+        return m.group(1).lower()
+
+    # 2. Otherwise accept a bare "x.y" token only if its last label is a known
+    #    TLD and it doesn't end in a known file extension.
+    for cand in _URL_IN_TITLE.findall(title):
+        host = cand.lower().rstrip(".")
+        labels = host.split(".")
+        if len(labels) < 2:
+            continue
+        tld = labels[-1]
+        if tld in _FILE_EXTENSIONS:
+            continue
+        if tld in _KNOWN_TLDS:
+            return host
     return None
 
 

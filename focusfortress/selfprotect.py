@@ -1,11 +1,19 @@
 """Protect our own process from being terminated.
 
-We modify the DACL of our own process token so that ``PROCESS_TERMINATE`` is
-denied to everyone (including the current user). Only SYSTEM can still kill it,
-and since we usually run elevated we retain PROCESS_ALL_ACCESS for ourselves.
+We modify the DACL of our own process so that ``PROCESS_TERMINATE`` (plus a few
+related rights) is denied to "Everyone". Because a deny ACE for Everyone is
+ordered ahead of any allow ACE in a canonical DACL, the effect is that
+*everyone* — including SYSTEM and the current user — is denied
+``PROCESS_TERMINATE``. (The SYSTEM allow entry we add below is therefore
+effectively a no-op for the denied rights; we keep it documented so the intent
+is clear, but it does NOT re-grant terminate to SYSTEM.) This is acceptable for
+our threat model: we only need to stop the interactive user from killing the
+process while a block is active, and we restore the default DACL in
+``disable_kill_protection``.
 
-Windows APIs used: ``GetCurrentProcess``, ``SetKernelObjectSecurity`` with an
-ACL that denies PROCESS_TERMINATE + PROCESS_VM_WRITE + PROCESS_CREATE_THREAD.
+Windows APIs used: ``GetCurrentProcess``, ``SetSecurityInfo`` with an ACL that
+denies PROCESS_TERMINATE + PROCESS_VM_WRITE + PROCESS_CREATE_THREAD +
+PROCESS_SUSPEND_RESUME.
 """
 from __future__ import annotations
 
@@ -105,7 +113,12 @@ def enable_kill_protection() -> bool:
         deny_everyone.Trustee.TrusteeType = _TRUSTEE_IS_WELL_KNOWN_GROUP
         deny_everyone.Trustee.ptstrName = "Everyone"
 
-        # Allow SYSTEM full access (so we can still be managed by us/service).
+        # Document an "allow SYSTEM full access" entry. NOTE: in a canonical
+        # DACL the deny-Everyone ACE above is ordered first and supersedes this
+        # allow for the denied rights, so SYSTEM is ALSO denied
+        # PROCESS_TERMINATE. We keep the entry to make intent explicit; it is
+        # effectively a no-op for the denied access mask. This is fine for our
+        # threat model (we only need to block the interactive user).
         allow_system = EXPLICIT_ACCESS_W()
         allow_system.grfAccessPermissions = 0x001F0FFF  # PROCESS_ALL_ACCESS
         allow_system.grfAccessMode = _GRANT_ACCESS

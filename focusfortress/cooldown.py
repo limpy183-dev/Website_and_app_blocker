@@ -5,6 +5,13 @@ an HMAC signature.  If the signature does not verify (because the user
 edited the file) we refuse to honour any "unlocked" flag and start a new
 fresh 1-hour wait, so tampering cannot shorten the wait.
 
+The signing key lives in ``%PROGRAMDATA%\\FocusFortress\\.cooldown.key`` and
+is locked down with a real Windows ACL (SYSTEM + Administrators only) so a
+non-admin user cannot read it and forge a signature.  This is
+defense-in-depth: a determined *local administrator* can always take
+ownership of (or simply delete) the key, which only forces a fresh
+cooldown rather than granting an instant unlock.
+
 The cooldown is also *clock-tamper resistant*: we anchor it against
 ``time.monotonic()`` AND against a wall-clock deadline.  On every check we
 take whichever of the two reports MORE remaining time - so moving the
@@ -20,6 +27,7 @@ import hmac
 import logging
 import os
 import secrets
+import subprocess
 import time
 from typing import Tuple
 
@@ -37,6 +45,41 @@ COOLDOWN_SECONDS = 60 * 60  # 1 hour
 # ---------------------------------------------------------------------------
 
 _KEY_FILE = DATA_DIR / ".cooldown.key"
+
+
+def _restrict_key_acl(path) -> None:
+    """Lock the HMAC key file down to SYSTEM + Administrators only.
+
+    %PROGRAMDATA%\\FocusFortress is user-READABLE by design, so without a
+    real ACL a non-admin user could read the signing key, forge a valid
+    signature, and write a forged "unlocked" state.  We use icacls with the
+    well-known SIDs (``*S-1-5-18`` = LocalSystem, ``*S-1-5-32-544`` =
+    Administrators) so it is language-independent.
+
+    This is defense-in-depth only: a determined *local administrator* can
+    always take ownership / remove the ACL (or delete the key entirely),
+    which simply forces a fresh cooldown.  The goal is to keep a normal
+    (non-admin) user from reading the key.
+
+    Fail-soft: a no-op on non-Windows and best-effort if icacls fails.
+    """
+    if os.name != "nt":
+        return
+    try:
+        p = str(path)
+        # Remove inherited perms, then grant only SYSTEM + Administrators full control.
+        subprocess.run(
+            ["icacls", p, "/inheritance:r"],
+            capture_output=True,
+            creationflags=0x08000000,
+        )
+        subprocess.run(
+            ["icacls", p, "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F"],
+            capture_output=True,
+            creationflags=0x08000000,
+        )
+    except Exception as e:
+        log.debug("cooldown key ACL failed: %s", e)
 
 
 def _key() -> bytes:
@@ -58,7 +101,7 @@ def _key() -> bytes:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         _KEY_FILE.write_bytes(new)
         try:
-            os.chmod(_KEY_FILE, 0o600)
+            _restrict_key_acl(_KEY_FILE)
         except Exception:
             pass
     except Exception as e:
@@ -66,10 +109,25 @@ def _key() -> bytes:
     return new
 
 
+def _boot_id() -> str:
+    """Identifier for the current boot session, used to bind monotonic
+    deadlines to this boot.  ``time.monotonic()`` resets on reboot, so a
+    stale ``until_mono`` from a previous boot can coincidentally fall inside
+    the acceptance window and be wrongly trusted.  Tagging the payload with
+    the boot time lets ``remaining_seconds()`` reject cross-boot monotonic
+    values.  Fail-soft: returns ``""`` if psutil is unavailable.
+    """
+    try:
+        import psutil
+        return f"{psutil.boot_time():.0f}"
+    except Exception:
+        return ""
+
+
 def _sign(payload: dict) -> str:
     msg = "|".join(
         f"{k}={payload.get(k, '')}"
-        for k in ("until_wall", "until_mono", "unlocked", "started_wall")
+        for k in ("until_wall", "until_mono", "unlocked", "started_wall", "boot")
     )
     return hmac.new(_key(), msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -134,15 +192,33 @@ def remaining_seconds() -> int:
 
     # Monotonic deadline (survives wall-clock tampering)
     try:
-        until_mono = float(payload["until_mono"])
-        rem_mono = until_mono - time.monotonic()
-        # If monotonic_ref is suspiciously old (i.e. process restart), the
-        # "until_mono" target won't be valid in our new monotonic clock - we
-        # detect that by also storing the started_wall instant: if the
-        # original-start wall-time is within a sane bound and monotonic
-        # disagrees wildly, prefer wall.  Practically, we just clamp:
-        if 0 < rem_mono <= COOLDOWN_SECONDS + 60:
-            rem = max(rem, int(rem_mono))
+        # Only trust the monotonic deadline if it was recorded during the
+        # current boot session.  time.monotonic() resets on reboot, so a
+        # stale "until_mono" from a previous boot can coincidentally land in
+        # the acceptance window below and be wrongly trusted - bind it to the
+        # boot id so cross-boot monotonic values are rejected (we then rely on
+        # the wall deadline, which survives reboot).
+        trust_mono = True
+        stored_boot = payload.get("boot", "")
+        if stored_boot:
+            try:
+                import psutil
+                cur_boot = int(float(psutil.boot_time()))
+                if cur_boot != int(float(stored_boot)):
+                    trust_mono = False  # rebooted since the cooldown was stored
+            except Exception:
+                pass  # psutil unavailable -> fall back to current behavior
+
+        if trust_mono:
+            until_mono = float(payload["until_mono"])
+            rem_mono = until_mono - time.monotonic()
+            # If monotonic_ref is suspiciously old (i.e. process restart), the
+            # "until_mono" target won't be valid in our new monotonic clock - we
+            # detect that by also storing the started_wall instant: if the
+            # original-start wall-time is within a sane bound and monotonic
+            # disagrees wildly, prefer wall.  Practically, we just clamp:
+            if 0 < rem_mono <= COOLDOWN_SECONDS + 60:
+                rem = max(rem, int(rem_mono))
     except Exception:
         pass
 
@@ -182,6 +258,7 @@ def start_cooldown() -> int:
         "until_wall": until_wall.isoformat(timespec="seconds"),
         "until_mono": f"{until_mono:.3f}",
         "started_wall": now_wall.isoformat(timespec="seconds"),
+        "boot": _boot_id(),
         "unlocked": False,
     }
     _save(payload)
@@ -202,6 +279,7 @@ def mark_unlocked() -> bool:
         "until_wall": now_wall.isoformat(timespec="seconds"),
         "until_mono": f"{time.monotonic():.3f}",
         "started_wall": now_wall.isoformat(timespec="seconds"),
+        "boot": _boot_id(),
         "unlocked": True,
     }
     _save(payload)

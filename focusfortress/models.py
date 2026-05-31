@@ -134,6 +134,9 @@ class PomodoroConfig:
     break_minutes: int = 5
     cycles: int = 4
     target_block: str = ""             # name of block list to drive
+    # ---- Long breaks (report §3.9) ----
+    long_break_minutes: int = 15       # duration of the long break
+    long_break_every: int = 4          # take a long break every Nth work cycle (0 = off)
     # ---- Phase warnings (report §6.2) - optional popups on phase changes ----
     phase_warnings: bool = False
     work_message: str = "Focus time. Distractions are blocked."
@@ -150,6 +153,7 @@ class FrozenTurkeyConfig:
     start: str = "22:00"
     end: str = "06:00"
     days: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])
+    warn_seconds: int = 60             # cancellable countdown before the action (0 = none)
 
 
 @dataclass
@@ -193,15 +197,45 @@ class GlobalSettings:
     frozen_turkey: FrozenTurkeyConfig = field(default_factory=FrozenTurkeyConfig)
 
 
+#: Current config schema version. Bump this whenever the on-disk shape
+#: changes in a way that needs an explicit migration (see ``_migrate_config``).
+#: A config with no ``schema_version`` key is treated as version 0.
+CONFIG_SCHEMA_VERSION = 1
+
+
+def _migrate_config(data: Dict[str, Any], from_version: int) -> Dict[str, Any]:
+    """Apply ordered migrations to bring ``data`` up to ``CONFIG_SCHEMA_VERSION``.
+
+    Each migration step transforms the *raw dict* (not dataclasses) from one
+    version to the next, so adding a future step is a matter of appending a
+    ``if v == N:`` branch that mutates ``data`` and increments ``v``.
+
+    Tolerant parsing in :meth:`AppConfig.from_dict` already defaults missing
+    keys and drops unknown ones, so version 0 -> 1 needs no field surgery; the
+    step exists to stamp the version and give later migrations a place to hook
+    in. Unknown / future versions are passed through untouched (forward-compat).
+    """
+    v = from_version
+    # v0 -> v1: introduce the explicit schema_version stamp. No data change.
+    if v < 1:
+        v = 1
+    # (future migrations: ``if v == 1: ...; v = 2`` etc.)
+    data["schema_version"] = max(v, from_version)
+    return data
+
+
 @dataclass
 class AppConfig:
     blocks: List[BlockList] = field(default_factory=list)
     settings: GlobalSettings = field(default_factory=GlobalSettings)
+    schema_version: int = CONFIG_SCHEMA_VERSION
 
     # ---- serialisation helpers ----
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
+        # Always stamp the current schema version on save.
+        d["schema_version"] = CONFIG_SCHEMA_VERSION
         # Keep the serialised warning block down to its core fields when the
         # optional extras are at their defaults, so old/simple configs
         # round-trip to exactly the documented shape.
@@ -216,6 +250,17 @@ class AppConfig:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "AppConfig":
+        # Run migrations first so the rest of the parser only ever sees a dict
+        # at the current schema version. A missing key means a pre-versioning
+        # config (version 0). An unknown future version is loaded best-effort.
+        try:
+            on_disk_version = int(d.get("schema_version", 0))
+        except (TypeError, ValueError):
+            on_disk_version = 0
+        if on_disk_version < CONFIG_SCHEMA_VERSION:
+            d = _migrate_config(dict(d), on_disk_version)
+        version = max(on_disk_version, CONFIG_SCHEMA_VERSION)
+
         blocks = []
         for b in d.get("blocks", []):
             lock = LockConfig(**_only_known(LockConfig, b.get("lock", {})))
@@ -245,4 +290,4 @@ class AppConfig:
             k: v for k, v in s.items() if k not in ("pomodoro", "frozen_turkey")
         })
         settings = GlobalSettings(pomodoro=pomo, frozen_turkey=ft, **s_clean)
-        return cls(blocks=blocks, settings=settings)
+        return cls(blocks=blocks, settings=settings, schema_version=version)

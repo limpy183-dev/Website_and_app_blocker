@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 
 from ...engine import Engine
 from ...models import ScheduleSlot
+from ..common import confirm
 from ..theme import Colors
 from ..widgets import Card, PageHeader
 
@@ -116,6 +117,51 @@ class ScheduleGrid(QWidget):
     def mouseReleaseEvent(self, e: QMouseEvent) -> None:
         self._dragging = False
 
+    # ----- preset helpers -----
+    def fill_range(self, days: list[int], start_min: int, end_min: int,
+                   value: bool = True) -> None:
+        """Paint ``value`` across ``days`` for the [start_min, end_min) window.
+
+        Minutes are clock minutes from 00:00. A window where ``end_min`` <=
+        ``start_min`` wraps past midnight (e.g. 22:00-06:00)."""
+        for d in days:
+            if not (0 <= d < 7):
+                continue
+            if end_min <= start_min:
+                # Wrap midnight: [start, 24:00) then [00:00, end).
+                self._paint_slots(d, start_min, 24 * 60, value)
+                self._paint_slots(d, 0, end_min, value)
+            else:
+                self._paint_slots(d, start_min, end_min, value)
+        self.update()
+        self.changed.emit()
+
+    def _paint_slots(self, day: int, start_min: int, end_min: int, value: bool) -> None:
+        start = max(0, start_min // 30)
+        end = min(SLOTS_PER_DAY, end_min // 30)
+        for i in range(start, end):
+            self._cells[day][i] = value
+
+    def clear_day(self, day: int) -> None:
+        if 0 <= day < 7:
+            self._cells[day] = [False] * SLOTS_PER_DAY
+            self.update()
+            self.changed.emit()
+
+    def clear_all(self) -> None:
+        self._cells = [[False] * SLOTS_PER_DAY for _ in range(7)]
+        self.update()
+        self.changed.emit()
+
+    def copy_day_to_all(self, src_day: int) -> None:
+        if not (0 <= src_day < 7):
+            return
+        row = list(self._cells[src_day])
+        for d in range(7):
+            self._cells[d] = list(row)
+        self.update()
+        self.changed.emit()
+
     # ----- painting -----
     def paintEvent(self, _ev) -> None:
         p = QPainter(self)
@@ -216,6 +262,35 @@ class ScheduleTab(QWidget):
             "Weekly grid",
             "Indigo cells = blocked. Drag to paint or erase.",
         )
+
+        # Preset toolbar (report §2.8): quick fills for common patterns.
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(8)
+        preset_row.addWidget(self._preset_label("Presets"))
+        weekdays_btn = QPushButton("Weekdays 9–5")
+        nights_btn = QPushButton("Nights 22:00–06:00")
+        self.copy_day_combo = QComboBox()
+        for name in DAYS:
+            self.copy_day_combo.addItem(name)
+        copy_btn = QPushButton("Copy day → all")
+        clear_day_btn = QPushButton("Clear day")
+        clear_all_btn = QPushButton("Clear all")
+        clear_all_btn.setProperty("variant", "danger")
+        weekdays_btn.clicked.connect(self._preset_weekdays)
+        nights_btn.clicked.connect(self._preset_nights)
+        copy_btn.clicked.connect(self._copy_day_to_all)
+        clear_day_btn.clicked.connect(self._clear_day)
+        clear_all_btn.clicked.connect(self._clear_all)
+        preset_row.addWidget(weekdays_btn)
+        preset_row.addWidget(nights_btn)
+        preset_row.addSpacing(12)
+        preset_row.addWidget(self.copy_day_combo)
+        preset_row.addWidget(copy_btn)
+        preset_row.addWidget(clear_day_btn)
+        preset_row.addStretch(1)
+        preset_row.addWidget(clear_all_btn)
+        grid_card.addLayout(preset_row)
+
         self.grid = ScheduleGrid()
         grid_card.addWidget(self.grid, 1)
         v.addWidget(grid_card, 1)
@@ -273,3 +348,37 @@ class ScheduleTab(QWidget):
 
     def _clear(self) -> None:
         self.grid.set_slots([])
+
+    # ----- presets -----
+    def _preset_label(self, text: str) -> QLabel:
+        lbl = QLabel(text.upper())
+        lbl.setStyleSheet(
+            f"color:{Colors.TEXT_MUTED};font-size:10.5px;"
+            f"font-weight:700;letter-spacing:1px;"
+        )
+        return lbl
+
+    def _preset_weekdays(self) -> None:
+        # Monday–Friday, 09:00–17:00.
+        self.grid.fill_range([0, 1, 2, 3, 4], 9 * 60, 17 * 60, True)
+
+    def _preset_nights(self) -> None:
+        # Every day, 22:00–06:00 (wraps midnight).
+        self.grid.fill_range(list(range(7)), 22 * 60, 6 * 60, True)
+
+    def _copy_day_to_all(self) -> None:
+        src = self.copy_day_combo.currentIndex()
+        if src < 0:
+            return
+        if confirm(self, f"Copy {DAYS[src]}'s schedule to every day? "
+                         "This overwrites the other days."):
+            self.grid.copy_day_to_all(src)
+
+    def _clear_day(self) -> None:
+        src = self.copy_day_combo.currentIndex()
+        if src >= 0:
+            self.grid.clear_day(src)
+
+    def _clear_all(self) -> None:
+        if confirm(self, "Clear the entire week's schedule?"):
+            self.grid.clear_all()

@@ -1,0 +1,403 @@
+================================================================================
+FOCUSFORTRESS — FEATURE & IMPROVEMENT REPORT
+Generated: 2026-05-31
+Scope: analysis of the current codebase (focusfortress/, tests/, docs/) with
+proposed new features and improvements to existing ones.
+================================================================================
+
+This report is the result of reading the engine, the four enforcement layers,
+the anti-bypass tiers, persistence, the CLI, and the full PyQt6 UI. It is
+organised so you can act on it in order:
+
+  1. Executive summary
+  2. Quick wins (high impact / low effort)
+  3. New features
+  4. Improvements to existing features
+  5. Robustness, code quality & testing
+  6. Suggested prioritised roadmap
+
+Each item is tagged [Impact: H/M/L] and [Effort: H/M/L]. File:line references
+point at the relevant code so each item is actionable.
+
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+FocusFortress is a well-architected, defense-in-depth blocker. The engine's
+idempotent `_apply()` design (engine.py:278), the clock-tamper-resistant clock
+(clock.py), the layered anti-bypass tiers, and the recently-completed warning
+subsystem are all solid. The single most polished area is warnings — and it
+shows in the test suite, which is *entirely* warnings-focused.
+
+The biggest opportunities fall into five buckets:
+
+  A. ENFORCEMENT GAPS — HTTPS path blocking, DoT/DoQ/custom-DoH bypasses, IPv6,
+     and config-file tampering are all reachable by a determined user. The
+     `pydivert` dependency is declared in requirements.txt but never used,
+     suggesting a packet-level layer was planned and never built.
+     NOTE: every new bypass-blocking feature proposed here is specified as an
+     independent, OFF-BY-DEFAULT user toggle, consistent with the app's existing
+     opt-in anti-bypass model (models.py:163-190). See the DESIGN PRINCIPLE at
+     the top of section 3A.
+
+  B. INSIGHTS ARE THIN — stats are total-time-per-site/app only: no history,
+     no charts, no trends, no goals. This is the weakest area versus
+     competitors (RescueTime, Cold Turkey, Freedom).
+
+  C. UX / ONBOARDING — no first-run wizard, no input validation anywhere, a
+     blunt 1-hour Advanced cooldown with no safe-mode escape, and a warning
+     editor with ~27 fields and no presets-you-can-save.
+
+  D. CLI IS PARTIAL — list/start/stop/toggle/lock only. No status, stats,
+     pomodoro, allowance, or config commands, and no machine-readable output.
+
+  E. TESTING — 31 tests, all about warnings. Zero coverage of hosts, proxy,
+     patterns, apps, locks, scheduling, allowances, cooldown, or config
+     round-tripping — i.e. the parts most likely to silently break.
+
+
+================================================================================
+2. QUICK WINS (high impact, low effort — do these first)
+================================================================================
+
+2.1 [Impact:H][Effort:L] Remove or wire up the unused `pydivert` dependency.
+    requirements.txt:4 pulls in pydivert (WinDivert) but no source file
+    imports it (verified by grep). Either delete the line (smaller install,
+    faster CI) or use it (see 3.1). Right now it's dead weight that implies a
+    capability the app doesn't have.
+
+2.2 [Impact:H][Effort:L] Add a `cli status` command. cli.py currently has no
+    way to ask "what is active right now and why?". A status command that
+    prints each block's effective state, lock kind, time-until-unlock, and
+    allowance-left would make the CLI scriptable and aid debugging. The data
+    already exists on the Engine (_effective_enabled, locks.can_disable).
+
+2.3 [Impact:M][Effort:L] Add `--json` output to CLI commands. cli.py:line
+    handlers print human text only. A `--json` flag makes the tool usable from
+    scripts, schedulers, and Stream Deck / automation setups.
+
+2.4 [Impact:H][Effort:L] Validate input before save in the Blocks editor.
+    blocks_tab.py accepts empty names, duplicate names, and malformed time
+    ranges (e.g. "25:00") with no feedback. A single validation pass on save
+    (non-empty unique name, well-formed HH:MM, non-negative allowance) prevents
+    a whole class of silent corruption.
+
+2.5 [Impact:M][Effort:L] Tray menu actions. main_window.py's tray menu only
+    offers "Open". Add "Start/Stop <block>", "Pause 5 min", and "Quit" so the
+    app is usable without opening the window. Hover tooltip should list active
+    blocks (currently none).
+
+2.6 [Impact:M][Effort:L] Block-page context. The block page (proxy.py /
+    block_page_tab.py) shows a generic quote. Include *which* block triggered
+    it and how long remains ("Blocked by 'Work' — 1h22m left"). The engine
+    already knows this; pass it into set_block_page().
+
+2.7 [Impact:M][Effort:L] Frozen Turkey pre-action warning. frozen_tab.py /
+    engine._update_frozen_turkey() (engine.py:694) fires lock/logoff/shutdown
+    with no countdown. A 60-second cancellable warning before shutdown prevents
+    lost work and is a one-function change (reuse the warning popup).
+
+2.8 [Impact:M][Effort:L] Schedule presets. schedule_tab.py is a bare 7x48 grid.
+    Add "Weekdays 9–5", "Every night 22:00–06:00", "Copy Monday to all",
+    "Clear day" buttons. Pure UI, big ergonomics gain.
+
+
+================================================================================
+3. NEW FEATURES
+================================================================================
+
+--- 3A. Enforcement & anti-bypass -------------------------------------------
+
+DESIGN PRINCIPLE (applies to this whole section): every bypass-blocking /
+anti-bypass feature below MUST be an independent user toggle that is OFF BY
+DEFAULT. This matches the app's existing convention — all current anti-bypass
+settings in GlobalSettings are opt-in and default OFF (models.py:163-190,
+e.g. protect_process, force_protect_termination, watchdog_enabled, block_doh,
+revert_proxy_tampering). New aggressive enforcement must not be silently on:
+the user opts in, can turn it back off (subject to any active lock/cooldown),
+and a fresh install behaves identically to today until toggles are enabled.
+
+3.1 [Impact:H][Effort:H] Packet-level (WinDivert/WFP) enforcement layer.
+    >> TOGGLE, DEFAULT OFF (new GlobalSettings flag, e.g. kernel_blocking).
+    The hosts+proxy approach is bypassable via raw IPv6, custom DoH/DoT/DoQ,
+    apps that ignore the WinINET proxy, and direct-IP connections. `pydivert`
+    is already a declared dependency (requirements.txt:4) but unused. A
+    WinDivert-based layer could drop/redirect traffic to blocked IPs and DNS
+    regardless of browser settings — closing the gaps below in one stroke.
+    This is the single highest-leverage enforcement upgrade; scope it as an
+    opt-in "kernel-grade blocking" toggle.
+
+3.2 [Impact:M][Effort:M] Block DoT (port 853) and DNS-over-QUIC.
+    >> TOGGLE, DEFAULT OFF (extend the existing block_doh pattern, or a sibling
+       block_dot flag). doh.py only
+    covers DoH endpoints (hardcoded list, doh.py:14-33). DNS-over-TLS and DoQ
+    are growing bypasses. Blocking TCP/UDP 853 to known resolvers (or via 3.1)
+    closes this.
+
+3.3 [Impact:M][Effort:M] Auto-updating DoH/resolver blocklist.
+    >> TOGGLE, DEFAULT OFF (this is part of the block_doh/block_dot feature; the
+       resolver list only matters when those toggles are on). doh.py's list
+    is hardcoded and already incomplete (no Brave, AliDNS, private instances).
+    Ship a bundled list that can be refreshed from a signed local file, and let
+    users add their own resolvers to block.
+
+3.4 [Impact:H][Effort:M] Config-file tamper detection.
+    >> TOGGLE, DEFAULT OFF (new GlobalSettings flag, e.g. protect_config). When
+       off, the app behaves exactly as today; when on, it signs and enforces.
+       config.json is
+    admin-writable but a user with any elevation (or the admin themselves in a
+    weak moment) can edit it directly to disable a locked block — bypassing the
+    Advanced cooldown and all lock gates entirely. Add an HMAC signature over
+    config.json (the cooldown system already does this for state.json,
+    cooldown.py:69-103) and refuse/restore on mismatch while a lock is active.
+
+3.5 [Impact:M][Effort:M] Per-app / per-browser site rules. Today all rules
+    apply system-wide. "Block YouTube in Chrome but allow it in Firefox" (or
+    "only during work apps") is a frequently requested Cold Turkey feature.
+    Requires correlating the foreground process with proxy decisions.
+
+3.6 [Impact:M][Effort:M] Browser-extension-bypass resistance.
+    >> TOGGLE, DEFAULT OFF (new GlobalSettings flag, e.g. block_bypass_tools;
+       killing VPN/proxy-switcher processes is aggressive, so it must be opt-in).
+       A user can
+    install a proxy-switcher or VPN extension to route around WinINET. Detect
+    common bypass extensions/VPN processes (extend apps.py rules with a curated
+    list) and optionally kill/block them while a block is active.
+
+3.7 [Impact:M][Effort:L] Strengthen UWP/window-title matching. apps.py UWP
+    detection is substring-based on Get-StartApps output (apps.py:140-146) and
+    window-title matching is naive substring (apps.py:111-114) — both are
+    easily evaded by renamed titles or reinstalls. Move to exact package family
+    names and offer regex/whole-word window matching.
+
+3.8 [Impact:L][Effort:M] Allowance idle detection should be activity-aware.
+    _consume_allowances() (engine.py:605) burns minutes whenever the system
+    isn't idle, even if the foreground window isn't a blocked resource. Gate
+    burn-down on the foreground window actually matching a blocked site/app
+    (the stats tracker already reads the foreground window, stats.py).
+
+--- 3B. Productivity & scheduling -------------------------------------------
+
+3.9 [Impact:H][Effort:M] Visible Pomodoro timer + tray badge. pomodoro_tab.py
+    has no live countdown; you must open the tab to see remaining time. Show
+    the current phase + remaining time in the window header and the tray
+    tooltip/icon. Add pause/skip-break/extend-break controls and a
+    "long break every 4th cycle" option (engine.py:667 _update_pomodoro).
+
+3.10 [Impact:M][Effort:M] Recurring/iCal-style schedules & templates.
+     schedule_tab.py only paints a single week with no recurrence semantics
+     beyond weekly repeat, no copy between days, no import/export of schedule
+     templates. Add named schedule templates and per-block schedule export.
+
+3.11 [Impact:M][Effort:M] Focus "sessions" / one-click start. A big "Start a
+     focus session for 25/50/90 min" button that enables a chosen block with a
+     timer lock, independent of Pomodoro config. Lowers the barrier to the most
+     common use case.
+
+3.12 [Impact:L][Effort:M] Goals & streaks. Let users set a daily target
+     ("< 30 min on social media") and track streaks of days met. Pairs with the
+     stats overhaul (3.13) and adds the habit-formation hook competitors lean
+     on.
+
+--- 3C. Insights / statistics (largest competitive gap) ---------------------
+
+3.13 [Impact:H][Effort:H] Stats history + charts. stats.py / stats_tab.py
+     aggregate lifetime totals only — no per-day buckets surfaced, no charts,
+     no trends. Persist daily buckets (the daily reset logic is already there)
+     and add: a daily/weekly bar chart, a top-N list, a time-of-day heatmap,
+     and "this week vs last week". Use QtCharts or render a simple bar widget.
+
+3.14 [Impact:M][Effort:M] CSV / report exports. stats_tab.py exports raw JSON
+     only. Add CSV (for spreadsheets) and a printable HTML/PDF weekly summary.
+
+3.15 [Impact:M][Effort:M] Track *blocked attempts*, not just usage. The proxy
+     (proxy.py) and app blocker (apps.py) know every time they denied access,
+     but nothing records it. A "you were stopped from X 14 times today" metric
+     is motivating and unique versus passive trackers.
+
+3.16 [Impact:L][Effort:M] Stats pruning + privacy controls. stats.json grows
+     unbounded (stats.py). Add retention (keep N days), an exclude-list, and a
+     pause-tracking toggle.
+
+--- 3D. UX, onboarding & platform ------------------------------------------
+
+3.17 [Impact:H][Effort:M] First-run setup wizard. New users land on an empty
+     editor with no guidance (main_window.py / app.py). A wizard that offers
+     starter block sets (Social, News, Gaming, Adult), asks about schedule and
+     strictness, and explains admin/anti-bypass would dramatically improve
+     adoption.
+
+3.18 [Impact:M][Effort:L] Settings backup / restore + profiles. No way to
+     export the whole config from the UI (only per-list site/warning JSON).
+     Add Export-All / Import-All and named profiles ("Work laptop", "Exam
+     week").
+
+3.19 [Impact:M][Effort:M] Native Windows notifications. The app only shows
+     in-app popups (warning_popup.py). Use Windows toast notifications for
+     non-modal events (block started, allowance low, pomodoro phase) so users
+     get feedback without a full popup.
+
+3.20 [Impact:M][Effort:M] In-app diagnostics / "is it working?" panel. There's
+     no way to confirm protection is live. A diagnostics page that shows: am I
+     elevated, is the proxy registered, is the hosts section written, are
+     watchdogs alive, last apply time. Surfaces the silent-elevation-failure
+     problem (elevation.py prints to stderr and continues with reduced
+     functionality, invisibly).
+
+3.21 [Impact:L][Effort:H] Cross-device / mobile companion. Explicitly out of
+     scope today (local-only by design). If ever desired, an optional
+     self-hosted sync or a phone "accountability" companion is the biggest
+     feature competitors have that this lacks. Note as a strategic direction,
+     not a near-term item.
+
+3.22 [Impact:L][Effort:M] Accessibility & keyboard shortcuts. No shortcuts
+     (Ctrl+S save, Ctrl+W close-to-tray), window size/position not persisted,
+     single hard-coded theme. Add shortcuts, remember window geometry, and a
+     light/dark toggle (theme.py is already centralised).
+
+
+================================================================================
+4. IMPROVEMENTS TO EXISTING FEATURES
+================================================================================
+
+4.1 [Impact:H][Effort:M] Advanced cooldown: add a documented safe path & fix
+    crash behaviour. cooldown.py enforces a blunt 1-hour wait on *any* Advanced
+    change with no in-UI explanation and no emergency path. Two concrete fixes:
+    (a) explain the cooldown in the UI before the user clicks a dead control
+    (advanced_tab.py event filter), and (b) verify behaviour when the process
+    crashes mid-cooldown — the wall+monotonic anchoring (cooldown.py:110-149)
+    should resume correctly, but there is no test proving it. Consider scaling
+    the penalty to the change's severity (toggling autostart != disabling Force
+    Protect).
+
+4.2 [Impact:M][Effort:L] Surface elevation/autostart failures to the user.
+    elevation.py and autostart.py both fail quietly (print/log then continue).
+    A user can believe they're protected when the hosts file can't be written.
+    Show a persistent banner when not elevated or when autostart registration
+    failed.
+
+4.3 [Impact:M][Effort:M] Config schema versioning + migration. from_dict()
+    (models.py:217) tolerantly drops unknown keys and defaults missing ones —
+    great for forward-compat, but it silently discards data on a real schema
+    change with no version field and no migration. Add a `schema_version` and
+    explicit migrations so upgrades don't lose settings.
+
+4.4 [Impact:M][Effort:L] Warning editor: presets you can save, and fewer
+    fields up front. The warning config exposes ~27 fields across sub-tabs
+    (models.py:57-88) with hardcoded presets in warnings.py. Let users save
+    their own presets, collapse advanced fields behind "Advanced…", and add
+    self-documenting labels (theme names like "exam"/"red_alert" are opaque).
+
+4.5 [Impact:M][Effort:L] Block editor: bulk operations + undo. blocks_tab.py
+    has no multi-select (enable/lock/delete many at once) and delete is
+    permanent with only a confirm. Add bulk actions and an undo for delete.
+
+4.6 [Impact:M][Effort:M] Schedule conflict & lock awareness. schedule_tab.py
+    doesn't warn when a painted schedule overlaps another block, or when a
+    schedule contradicts an active lock. Add light validation/visual hints.
+
+4.7 [Impact:L][Effort:L] Status refresh latency. main_window.py polls every 2s;
+    interactive enable/disable feels laggy. Mutations already call _apply()
+    immediately — also refresh the status pill on the same action instead of
+    waiting for the next poll.
+
+4.8 [Impact:L][Effort:L] Pattern language is undocumented in-UI. The same
+    BlockList.sites string is interpreted differently by hosts.py (domains) and
+    patterns.py (full patterns) — a known footgun called out in CLAUDE.md. Add
+    inline help/examples in the Websites editor and a "test this pattern"
+    field that shows whether a sample URL would be blocked.
+
+4.9 [Impact:L][Effort:L] Block-page preview & templates. block_page_tab.py
+    takes raw HTML with no preview and no starter template. Add a live preview
+    pane and a couple of example templates.
+
+4.10 [Impact:L][Effort:M] Proxy robustness. proxy.py is HTTP/1.0
+     (BaseHTTPRequestHandler), unauthenticated on 127.0.0.1:58123, and has no
+     connection cap (ThreadingHTTPServer). Consider a connection limit and
+     review keep-alive/framing (the module docstring already flags this as
+     delicate) before adding features on top.
+
+
+================================================================================
+5. ROBUSTNESS, CODE QUALITY & TESTING
+================================================================================
+
+5.1 [Impact:H][Effort:M] Test the enforcement core. All 31 tests are about
+    warnings (tests/test_warning_*.py). There is ZERO coverage of the code most
+    likely to break a release:
+      - patterns.py  → URL/domain match correctness (the bypass surface)
+      - hosts.py     → _extract_domain, variant expansion, marker writing
+      - locks.py     → can_disable() for all five kinds, incl. boundary times
+      - engine.py    → _effective_enabled, _slot_active_now (incl. wrap-midnight
+                       and DST), allowance burn-down and daily reset
+      - config_store → atomic write, corrupt-config recovery, round-trip
+      - cooldown.py  → monotonic+wall anchoring survives clock moves & restarts
+    These are pure-logic and run cross-platform already (the suite runs on
+    macOS/Linux). High value per hour.
+
+5.2 [Impact:M][Effort:L] Settle the duplicated warning entry points. The engine
+    carries several parallel warning-dispatch mechanisms with overlapping
+    responsibilities: _dispatch_block_warnings, _emit_newly_active_warnings,
+    _emit_block_activation_warnings, plus three registration styles
+    (add_warning_listener / set_warning_handler / set_warning_callback)
+    (engine.py:110-588). This is documented in CLAUDE.md as intentional
+    reconciliation, but it's a maintenance hazard. Pick one path, delete the
+    others, keep thin shims if needed for tests.
+
+5.3 [Impact:M][Effort:M] Two parallel warning config surfaces. A warning can be
+    enabled via the nested WarningConfig *or* the flat BlockList.warning_*
+    fields, with differing defaults (popup duration 8 vs 10) — models.py:57 vs
+    113-127, reconciled in engine._effective_warning (engine.py:385). This is a
+    real correctness trap. Deprecate the flat surface (keep read-compat for old
+    configs, stop writing it) and converge on the nested config.
+
+5.4 [Impact:M][Effort:L] DST / wrap-midnight scheduling tests. _slot_active_now
+    (engine.py:50) and Frozen Turkey (engine.py:694) both handle windows that
+    wrap midnight; clock.py adds monotonic anchoring. None of this is tested
+    around a DST transition. Add table-driven tests.
+
+5.5 [Impact:L][Effort:L] Structured logging + a log viewer. Logging goes to a
+    file with no in-UI access. A simple "Open log" button and consistent log
+    levels would speed up field debugging (ties into 3.20 diagnostics).
+
+5.6 [Impact:L][Effort:L] CLI ergonomics. cli.py timer parsing accepts "02:30"
+    but not "2:30" and doesn't validate bounds; "block not found" doesn't
+    suggest near-matches or list blocks. Small polish, frequent friction.
+
+5.7 [Impact:L][Effort:L] requirements.txt hygiene. Beyond the unused pydivert
+    (2.1), pin or range-check deps and document that PyQt6/pywin32 are
+    Windows-runtime-only while the test suite runs headless anywhere.
+
+
+================================================================================
+6. SUGGESTED PRIORITISED ROADMAP
+================================================================================
+
+Phase 1 — Foundations & quick wins (days)
+  - 2.1 drop/wire pydivert        - 2.4 input validation
+  - 2.2 cli status + 2.3 --json   - 5.1 enforcement-core tests
+  - 4.2 surface elevation failures - 2.7 Frozen Turkey countdown
+
+Phase 2 — Close the bypass gaps (1–2 weeks)
+  (all new enforcement features ship as OFF-BY-DEFAULT toggles — see 3A)
+  - 3.4 config tamper detection (HMAC)   - 3.2 DoT/DoQ blocking
+  - 3.3 updatable resolver list          - 3.7 stronger app matching
+  - 3.6 bypass-tool resistance           - 4.1 cooldown safe path + crash test
+
+Phase 3 — Insight & UX (2–4 weeks)
+  - 3.13 stats history + charts          - 3.17 first-run wizard
+  - 3.9  visible Pomodoro + tray badge   - 3.20 diagnostics panel
+  - 3.15 track blocked attempts          - 3.18 backup/restore profiles
+
+Phase 4 — Strategic / larger bets
+  - 3.1  WinDivert/WFP enforcement layer (the big one; unlocks 3.2/3.5/3.6)
+  - 3.5  per-app/per-browser rules        - 3.12 goals & streaks
+  - 5.2 / 5.3 consolidate the warning subsystem
+
+Cross-cutting (do alongside everything): grow the test suite (5.1, 5.4) and
+add schema versioning (4.3) before the next config-shape change.
+
+================================================================================
+END OF REPORT
+================================================================================

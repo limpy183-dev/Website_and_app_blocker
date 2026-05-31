@@ -1,7 +1,10 @@
 """Manage the Windows hosts file for domain-level blocking."""
 from __future__ import annotations
 
+import os
 import re
+import stat
+import tempfile
 from typing import Iterable, List
 
 from ..paths import HOSTS_FILE, HOSTS_MARK_BEGIN, HOSTS_MARK_END
@@ -25,8 +28,13 @@ def _extract_domain(pattern: str) -> str | None:
     # Reject wildcards in the hostname - these go to the proxy path-matcher only
     if "*" in p:
         return None
-    # Strip leading www.
-    return p.lstrip(".")
+    # Strip leading dots, then a leading "www." so we don't later re-expand it
+    # into "www.www.x.com" (and so "www.x.com" and "x.com" collapse to one
+    # canonical domain that _expand_variants re-adds the www. form for).
+    p = p.lstrip(".")
+    if p.startswith("www."):
+        p = p[len("www."):]
+    return p or None
 
 
 def _expand_variants(domain: str) -> List[str]:
@@ -71,8 +79,6 @@ def write_block_section(domains: Iterable[str]) -> None:
     body_lines.append(HOSTS_MARK_END)
 
     new_content = pre.rstrip() + "\n\n" + "\n".join(body_lines) + "\n" + post.lstrip("\n")
-    import os
-    import stat
 
     was_ro = False
     try:
@@ -83,8 +89,26 @@ def write_block_section(domains: Iterable[str]) -> None:
     except Exception:
         pass
 
+    # Write atomically: a crash mid-write must never leave a half-written
+    # system hosts file. We write to a temp file in the SAME directory (so
+    # os.replace is an atomic rename on the same volume) then swap it in.
+    target_dir = os.path.dirname(str(HOSTS_FILE)) or "."
+    tmp_path: str | None = None
     try:
-        HOSTS_FILE.write_text(new_content, encoding="utf-8")
+        fd, tmp_path = tempfile.mkstemp(prefix=".ff-hosts-", dir=target_dir)
+        try:
+            # Match the previous Path.write_text behaviour: default newline
+            # translation (so "\n" becomes the platform newline on write).
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(new_content)
+            os.replace(tmp_path, HOSTS_FILE)
+            tmp_path = None  # successfully consumed by replace
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
     except PermissionError:
         # We are probably not elevated; surface the error upstream
         raise
