@@ -1,0 +1,1 @@
+"""Individual UI tabs."""
